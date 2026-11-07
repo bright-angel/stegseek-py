@@ -1,0 +1,30 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local-only reference material: upstream C++ sources (GPL) and the Windows
+# steghide.exe oracle. They are not redistributed; CROSS_VALIDATION.md
+# documents how to obtain them for reproducible verification.
+_reference/
+
+# Generated cross-validation corpus, recreated by scripts/cross_validate.py
+crossval/
+
+# Workspace-local agent state and memory
+.workbuddy/
+
+# Extracted payloads
+*.out

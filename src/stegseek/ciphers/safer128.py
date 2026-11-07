@@ -1,0 +1,275 @@
+"""Pure-Python port of libmcrypt's SAFER-SK128 block cipher.
+
+Faithful translation of ``_reference/libsrc/algorithms/safer128.c``.  Block
+size is 8 bytes, key size is 16 bytes.  ``create()`` fixes the key to exactly
+16 bytes.
+
+Byte / word order
+-----------------
+SAFER is pure byte-oriented; there is no ``WORDS_BIGENDIAN`` branch and no
+``byteswap32`` in the file.  A block is the eight input bytes in order and the
+C ``_mcrypt_self_test`` prints ``sprintf("%.2x", ciphertext[j])`` for
+``j = 0..7`` (sequential bytes).  All arithmetic is modulo 256.
+
+Differences from SAFER-SK64 (safer64.py)
+----------------------------------------
+The only difference in the two C ``_mcrypt_set_key`` routines is the 128-bit
+key split::
+
+    safer64.c : ka[j] = ROL(userkey[j],   5); key[1+j] = kb[j] = userkey[j]
+    safer128.c: ka[j] = ROL(userkey_1[j], 5); key[1+j] = kb[j] = userkey_2[j]
+                with userkey_1 = &userkey[0], userkey_2 = &userkey[8]
+
+i.e. SK-128 derives ``ka`` from the *first* 8 key bytes and seeds subkey K1
+(and ``kb``) from the *last* 8 key bytes.  Both files use
+``nof_rounds = SAFER_SK64_DEFAULT_NOF_ROUNDS`` (8) and the strengthened key
+schedule.  The encrypt/decrypt routines are byte-for-byte identical to SK-64.
+
+The exp/log tables come from the exact ``_mcrypt_Safer_Init_Module`` loop
+(``exp = 1; exp = exp*45 % 257``), not hand-transcribed constants.
+
+Public API::
+
+    create(key: bytes) -> _SAFER128         # key must be exactly 16 bytes
+    _SAFER128.block_size == 8
+    _SAFER128.encrypt_block(block) -> bytes
+    _SAFER128.decrypt_block(block) -> bytes
+    self_test() -> bool                     # silent on success
+"""
+
+from __future__ import annotations
+
+from .base import BlockCipherBase
+
+_ROUNDS = 8
+_KEY_SIZE = 16
+
+
+def _make_tables():
+    exp_tab = [0] * 256
+    log_tab = [0] * 256
+    exp = 1
+    for i in range(256):
+        exp_tab[i] = exp & 0xFF
+        log_tab[exp_tab[i]] = i
+        exp = exp * 45 % 257
+    return exp_tab, log_tab
+
+
+_EXP, _LOG = _make_tables()
+
+
+def _rol8(x, n):
+    return ((x << n) | ((x & 0xFF) >> (8 - n))) & 0xFF
+
+
+def _pht(x, y):
+    y = (y + x) & 0xFF
+    x = (x + y) & 0xFF
+    return x, y
+
+
+def _ipht(x, y):
+    x = (x - y) & 0xFF
+    y = (y - x) & 0xFF
+    return x, y
+
+
+def _expand_key(userkey):
+    """Port of ``_mcrypt_set_key`` (SK-128, strengthened key schedule)."""
+    key = [_ROUNDS & 0xFF]
+    ka = [0] * 9
+    kb = [0] * 9
+    uk1 = userkey[:8]
+    uk2 = userkey[8:16]
+    for j in range(8):
+        ka[j] = _rol8(uk1[j], 5)
+        ka[8] ^= ka[j]
+        kb[j] = uk2[j]
+        key.append(uk2[j])
+        kb[8] ^= kb[j]
+    for i in range(1, _ROUNDS + 1):
+        for j in range(9):
+            ka[j] = _rol8(ka[j], 6)
+            kb[j] = _rol8(kb[j], 6)
+        for j in range(8):
+            key.append((ka[(j + 2 * i - 1) % 9]
+                        + _EXP[_EXP[18 * i + j + 1]]) & 0xFF)
+        for j in range(8):
+            key.append((kb[(j + 2 * i) % 9]
+                        + _EXP[_EXP[18 * i + j + 10]]) & 0xFF)
+    return key
+
+
+def _encrypt_block(key, block):
+    r = key[0]
+    kp = 0
+
+    def nxt():
+        nonlocal kp
+        kp += 1
+        return key[kp]
+
+    a, b, c, d, e, f, g, h = block
+    for _ in range(r):
+        a ^= nxt()
+        b = (b + nxt()) & 0xFF
+        c = (c + nxt()) & 0xFF
+        d ^= nxt()
+        e ^= nxt()
+        f = (f + nxt()) & 0xFF
+        g = (g + nxt()) & 0xFF
+        h ^= nxt()
+        a = (_EXP[a] + nxt()) & 0xFF
+        b = _LOG[b] ^ nxt()
+        c = _LOG[c] ^ nxt()
+        d = (_EXP[d] + nxt()) & 0xFF
+        e = (_EXP[e] + nxt()) & 0xFF
+        f = _LOG[f] ^ nxt()
+        g = _LOG[g] ^ nxt()
+        h = (_EXP[h] + nxt()) & 0xFF
+        a, b = _pht(a, b)
+        c, d = _pht(c, d)
+        e, f = _pht(e, f)
+        g, h = _pht(g, h)
+        a, c = _pht(a, c)
+        e, g = _pht(e, g)
+        b, d = _pht(b, d)
+        f, h = _pht(f, h)
+        a, e = _pht(a, e)
+        b, f = _pht(b, f)
+        c, g = _pht(c, g)
+        d, h = _pht(d, h)
+        t = b
+        b = e
+        e = c
+        c = t
+        t = d
+        d = f
+        f = g
+        g = t
+    a ^= nxt()
+    b = (b + nxt()) & 0xFF
+    c = (c + nxt()) & 0xFF
+    d ^= nxt()
+    e ^= nxt()
+    f = (f + nxt()) & 0xFF
+    g = (g + nxt()) & 0xFF
+    h ^= nxt()
+    return bytes((a & 0xFF, b & 0xFF, c & 0xFF, d & 0xFF,
+                  e & 0xFF, f & 0xFF, g & 0xFF, h & 0xFF))
+
+
+def _decrypt_block(key, block):
+    r = key[0]
+    kp = 8 + 16 * r
+
+    def cur():
+        return key[kp]
+
+    def dec():
+        nonlocal kp
+        kp -= 1
+        return key[kp]
+
+    a, b, c, d, e, f, g, h = block
+    h ^= cur()
+    g = (g - dec()) & 0xFF
+    f = (f - dec()) & 0xFF
+    e ^= dec()
+    d ^= dec()
+    c = (c - dec()) & 0xFF
+    b = (b - dec()) & 0xFF
+    a ^= dec()
+    for _ in range(r):
+        t = e
+        e = b
+        b = c
+        c = t
+        t = f
+        f = d
+        d = g
+        g = t
+        a, e = _ipht(a, e)
+        b, f = _ipht(b, f)
+        c, g = _ipht(c, g)
+        d, h = _ipht(d, h)
+        a, c = _ipht(a, c)
+        e, g = _ipht(e, g)
+        b, d = _ipht(b, d)
+        f, h = _ipht(f, h)
+        a, b = _ipht(a, b)
+        c, d = _ipht(c, d)
+        e, f = _ipht(e, f)
+        g, h = _ipht(g, h)
+        h = (h - dec()) & 0xFF
+        g ^= dec()
+        f ^= dec()
+        e = (e - dec()) & 0xFF
+        d = (d - dec()) & 0xFF
+        c ^= dec()
+        b ^= dec()
+        a = (a - dec()) & 0xFF
+        h = (_LOG[h & 0xFF] ^ dec()) & 0xFF
+        g = (_EXP[g & 0xFF] - dec()) & 0xFF
+        f = (_EXP[f & 0xFF] - dec()) & 0xFF
+        e = (_LOG[e & 0xFF] ^ dec()) & 0xFF
+        d = (_LOG[d & 0xFF] ^ dec()) & 0xFF
+        c = (_EXP[c & 0xFF] - dec()) & 0xFF
+        b = (_EXP[b & 0xFF] - dec()) & 0xFF
+        a = (_LOG[a & 0xFF] ^ dec()) & 0xFF
+    return bytes((a & 0xFF, b & 0xFF, c & 0xFF, d & 0xFF,
+                  e & 0xFF, f & 0xFF, g & 0xFF, h & 0xFF))
+
+
+class _SAFER128(BlockCipherBase):
+    block_size = 8
+
+    def __init__(self, key: bytes) -> None:
+        self._key = _expand_key(list(key))
+
+    def encrypt_block(self, block: bytes) -> bytes:
+        block = bytes(block)
+        if len(block) != 8:
+            raise ValueError("block must be exactly 8 bytes")
+        return _encrypt_block(self._key, list(block))
+
+    def decrypt_block(self, block: bytes) -> bytes:
+        block = bytes(block)
+        if len(block) != 8:
+            raise ValueError("block must be exactly 8 bytes")
+        return _decrypt_block(self._key, list(block))
+
+
+def create(key: bytes) -> _SAFER128:
+    """Return a SAFER-SK128 cipher; ``key`` must be exactly 16 bytes."""
+    if not isinstance(key, (bytes, bytearray, memoryview)):
+        raise TypeError("key must be bytes")
+    key = bytes(key)
+    if len(key) != _KEY_SIZE:
+        raise ValueError("key must be exactly 16 bytes")
+    return _SAFER128(key)
+
+
+# Verbatim from safer128.c ``_mcrypt_self_test``:
+#     #define CIPHER "35ed856e2cf90947"
+# keyword[j] = (j*2+10) % 256 (16 bytes), plaintext[j] = j % 256 (8 bytes).
+CIPHER = "35ed856e2cf90947"
+
+
+def self_test() -> bool:
+    """Verify the C known-answer vector and a round trip; silent on success."""
+    key = bytes((j * 2 + 10) % 256 for j in range(16))
+    pt = bytes(j % 256 for j in range(8))
+
+    cipher = create(key)
+    ct = cipher.encrypt_block(pt)
+    if ct.hex() != CIPHER:
+        return False
+    if cipher.decrypt_block(ct) != pt:
+        return False
+
+    buf = bytes((j * 37 + 11) % 256 for j in range(8 * 5))
+    if cipher.decrypt(cipher.encrypt(buf)) != buf:
+        return False
+    return True
